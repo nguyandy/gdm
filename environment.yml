@@ -80,4 +80,4 @@ dependencies:
     - seawater==3.3.4
     - threadpoolctl==2.1.0
     - tqdm==4.54.1
-prefix: /Users/kerfoot/anaconda3/envs/gdm
+
