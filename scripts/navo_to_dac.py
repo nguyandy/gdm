@@ -6,8 +6,11 @@ import sys
 import argparse
 import datetime
 from xarray import DataArray
+import pandas as pd
 from gdm import GliderDataModel
-from gdm.gliders.slocum import load_slocum_dba, build_dbas_data_frame
+from gdm.gliders.navoceano import load_navo_nc
+from gdm.ctd import calculate_density
+from gsw import p_from_z
 
 
 def main(args):
@@ -22,7 +25,7 @@ def main(args):
 
     debug = args.debug
     config_path = args.config_path
-    dba_files = args.dba_files
+    nc_files = args.nc_files
     drop_missing = args.drop
     profiles = args.profiles
     ngdac = args.ngdac
@@ -34,8 +37,8 @@ def main(args):
         logging.error('Invalid configuration path: {:}'.format(config_path))
         return 1
 
-    if not dba_files:
-        logging.error('No dba files specified')
+    if not nc_files:
+        logging.error('No NAVOCEANO NetCDF files specified')
         return 1
 
     if not os.path.isdir(nc_dest):
@@ -44,7 +47,7 @@ def main(args):
 
     logging.info('Configuration path: {:}'.format(config_path))
     logging.info('NetCDF destination: {:}'.format(nc_dest))
-    logging.info('Processing {:} dba files'.format(len(dba_files)))
+    logging.info('Processing {:} dba files'.format(len(nc_files)))
     if profiles:
         logging.info('Writing profile-based NetCDFs')
     else:
@@ -54,15 +57,34 @@ def main(args):
     logging.debug('{:}'.format(gdm))
 
     netcdf_count = 0
-    for dba_file in dba_files:
-        logging.info('Processing {:}'.format(dba_file))
+    for nc_file in nc_files:
 
-        dba_df, pro_meta = load_slocum_dba(dba_file)
-
-        if dba_df.empty:
+        if nc_file.endswith('optics.nc'):
+            logging.info('Skipping optics file: {:}'.format(nc_file))
             continue
 
-        gdm.data = dba_df
+        logging.info('Processing {:}'.format(nc_file))
+
+        nc_path, nc_name = os.path.split(nc_file)
+        fname, ext = os.path.splitext(nc_name)
+
+        nc_df, pro_meta, nc_ds = load_navo_nc(nc_file)
+
+        # NAVOCEANO NetCDF files do not contain pressure, so we need to calculate that from depth and latitude
+        nc_df['pressure'] = p_from_z(-nc_df.depth, nc_df.latitude.mean())
+        # NAVOCEANO NetCDF files do not contain density, so we need to calculate it
+        nc_df['density'] = calculate_density(nc_df.temp,
+                                             nc_df.pressure,
+                                             nc_df.salinity,
+                                             nc_df.latitude,
+                                             nc_df.longitude)
+        # Convert nc_df.scitime from a timedelta to a datetime64
+        nc_df['scitime'] = pd.to_datetime(pd.Series([td.total_seconds() for td in nc_df.scitime]), unit='s').values
+
+        if nc_df.empty:
+            continue
+
+        gdm.data = nc_df
         gdm.profiles = pro_meta
 
         if debug:
@@ -70,33 +92,35 @@ def main(args):
             logging.info('debug switch set so no NetCDF creation')
             continue
 
-        dba_meta = build_dbas_data_frame(dba_file)
-        if dba_meta.empty:
-            continue
+        # dba_meta = build_dbas_data_frame(nc_file)
+        # if dba_meta.empty:
+        #     continue
 
         if not profiles:
             logging.info('Writing time-series...')
             ds = gdm.to_timeseries_dataset(drop_missing=drop_missing)
-            fname, ext = os.path.splitext(dba_meta.iloc[0].file)
 
             # Update history attribute
             if 'history' not in ds.attrs:
                 ds.attrs['history'] = ''
             new_history = '{:}: {:} {:}'.format(datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                                                 sys.argv[0],
-                                                dba_file)
+                                                nc_file)
             if ds.attrs['history'].strip():
                 ds.attrs['history'] = '{:}\n{:}'.format(ds.attrs['history'], new_history)
             else:
                 ds.attrs['history'] = '{:}'.format(ds.attrs['history'], new_history)
 
             # Update the source global attribute
-            profile_ds.attrs['source'] = dba_file
+            ds.attrs['source'] = nc_file
+
+            # Update the source global attribute
+            ds.attrs['source'] = nc_file
 
             # Add the source_file variable
-            source_file_attrs = dba_meta.to_dict(orient='records')[0]
-            source_file_attrs['bytes'] = '{:}'.format(source_file_attrs['bytes'])
-            profile_ds['source_file'] = DataArray(source_file_attrs['filename_label'], attrs=source_file_attrs)
+            source_file_attrs = nc_ds.attrs.copy()
+            source_file_attrs['bytes'] = '{:}'.format(os.path.getsize(nc_file))
+            ds['source_file'] = DataArray(source_file_attrs['filename_label'], attrs=source_file_attrs)
 
             netcdf_path = os.path.join(nc_dest, '{:}.nc'.format(fname))
             logging.info('Writing: {:}'.format(netcdf_path))
@@ -104,17 +128,19 @@ def main(args):
             netcdf_count += 1
         else:
             logging.info('Writing profiles...')
-            glider = dba_meta.iloc[0].glider
-            dbd_type = dba_meta.iloc[0].filename_extension
-            if ngdac:
-                dbd_type = 'rt'
-                if dba_meta.iloc[0].filename_extension != 'sbd':
-                    dbd_type = 'delayed'
+            glider = os.path.basename(nc_file).split('_')[0]
+            dbd_type = 'rt'
 
             for profile_time, profile_ds in gdm.iter_profiles(drop_missing=drop_missing):
                 netcdf_path = os.path.join(nc_dest,
                                            '{:}_{:}_{:}.nc'.format(glider, profile_time.strftime('%Y%m%dT%H%M%SZ'),
                                                                    dbd_type))
+                # Rename latitude and longitude to lat and lon
+                profile_ds = profile_ds.rename({'latitude': 'lat', 'longitude': 'lon'})
+
+                # Set profile_lat and profile_lon
+                profile_ds.profile_lat.values = profile_ds.lat.mean()
+                profile_ds.profile_lon.values = profile_ds.lon.mean()
 
                 if os.path.isfile(netcdf_path):
                     if not clobber:
@@ -130,19 +156,19 @@ def main(args):
                 new_history = '{:}: {:} --profiles {:}'.format(
                     datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
                     sys.argv[0],
-                    dba_file)
+                    nc_file)
                 if profile_ds.attrs['history'].strip():
                     profile_ds.attrs['history'] = '{:}\n{:}'.format(profile_ds.attrs['history'], new_history)
                 else:
                     profile_ds.attrs['history'] = '{:}'.format(new_history)
 
                 # Update the source global attribute
-                profile_ds.attrs['source'] = dba_file
+                profile_ds.attrs['source'] = nc_file
 
                 # Add the source_file variable
-                source_file_attrs = dba_meta.to_dict(orient='records')[0]
-                source_file_attrs['bytes'] = '{:}'.format(source_file_attrs['bytes'])
-                profile_ds['source_file'] = DataArray(source_file_attrs['filename_label'], attrs=source_file_attrs)
+                source_file_attrs = nc_ds.attrs.copy()
+                source_file_attrs['bytes'] = '{:}'.format(os.path.getsize(nc_file))
+                profile_ds['source_file'] = DataArray(nc_name, attrs=source_file_attrs)
 
                 logging.info('Writing: {:}'.format(netcdf_path))
                 profile_ds.to_netcdf(netcdf_path)
@@ -161,8 +187,8 @@ if __name__ == '__main__':
     arg_parser.add_argument('config_path',
                             help='Location of deployment configuration files')
 
-    arg_parser.add_argument('dba_files',
-                            help='Source ASCII dba files to process',
+    arg_parser.add_argument('nc_files',
+                            help='NAVOCEANO NetCDF files to process',
                             nargs='+')
 
     arg_parser.add_argument('-p', '--profiles',

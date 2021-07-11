@@ -228,14 +228,18 @@ class GliderDataModel(object):
 
         return self._ds
 
-    def iter_profiles(self):
+    def iter_profiles(self, drop_missing=False):
         """
+        Iterate through each profile dataset.
+        Parameters:
+        drop_missing: variables not defined in sensor_defs.yml are included in the dataset by default. Set to True
+            to drop undefined variadropped frombles.
 
-        :return:
+        :return: an iterator that returns the next profile midpoint time and profile dataset
         """
 
         for profile_time, row in self._profiles_meta.iterrows():
-            yield profile_time, self.slice_profile_dataset(profile_time)
+            yield profile_time, self.slice_profile_dataset(profile_time, drop_missing=drop_missing)
 
     def _set_global_attributes(self):
         """
@@ -326,6 +330,10 @@ class GliderDataModel(object):
             self._logger.warning('No deployment platform configuration found. Skipping platform variable creation')
             return
 
+        # Set up the platform:instruments attribute with the instrument variable names, if there are any
+        deployment_config['platform']['instruments'] = ','.join(
+            [i.get('nc_var_name', '') for i in self._config_parameters['instruments']])
+
         # Add platform variables
         self._logger.debug('Creating platform variable...')
         platform_atts = deployment_config.get('platform', {})
@@ -350,7 +358,7 @@ class GliderDataModel(object):
         self._logger.debug('Creating profile_id variable...')
         profile_id_def = self._config_parameters['sensor_defs'].get('profile_id', {})
         profile_id_attrs = profile_id_def.get('attrs', {})
-        self._ds['profile_id'] = xr.DataArray(timestamp, attrs=profile_id_attrs)
+        self._ds['profile_id'] = xr.DataArray(int(timestamp.timestamp()), attrs=profile_id_attrs)
         self._ds.profile_id.encoding = {'_FillValue': default_fillvals['f8'], 'dtype': 'f8', 'complevel': 1,
                                         'zlib': True}
 
@@ -385,6 +393,7 @@ class GliderDataModel(object):
         # Rename variables and update attributes
         rename_mappings = {}
         for v in self._ds.variables:
+
             if v.startswith('instrument_'):
                 # Skip instrument variables as they and their attributes are found in the instruments.yml config file
                 continue
@@ -508,13 +517,24 @@ class GliderDataModel(object):
                 self._logger.debug('Configuring {:}: {:}'.format(config_type, config_path))
                 self._config_parameters[config_type] = config_params
 
+        # Update global attributes (global_attributes.yml) with any global attributes that are contained in
+        # deployment.yml
+        self._config_parameters['global_attributes'].update(
+            self._config_parameters['deployment'].get('global_attributes', {}))
+
+        # Slocum glider names sensors in all lowercase letters despite the fact that masterdata has some sensors that
+        # contain capital letters. So we need to lowercase the keys in self._config_params['sensor_defs']
+        lc_defs = {sensor.lower(): items for sensor, items in self._config_parameters['sensor_defs'].items()}
+        self._config_parameters['sensor_defs'] = lc_defs
+
         # Set up the encoding dictionary.  Create an entry for each sensor name as well as the nc_var_name.  This will
         # allow self._finalize_variables to be called before or after self._set_encodings
         for sensor, sensor_desc in self._config_parameters['sensor_defs'].items():
-            self._encodings[sensor] = self._default_encoding.copy()
-            self._encodings[sensor]['dtype'] = sensor_desc.get('dtype', self._default_encoding['dtype'])
-            if sensor != sensor_desc.get('nc_var_name', sensor):
-                self._encodings[sensor_desc.get('nc_var_name')] = self._encodings[sensor].copy()
+            lc_sensor = sensor.lower()
+            self._encodings[lc_sensor] = self._default_encoding.copy()
+            self._encodings[lc_sensor]['dtype'] = sensor_desc.get('dtype', self._default_encoding['dtype'])
+            if lc_sensor != sensor_desc.get('nc_var_name', lc_sensor):
+                self._encodings[sensor_desc.get('nc_var_name')] = self._encodings[lc_sensor].copy()
 
     def _add_temporal_geospatial_attributes(self):
         atts = {'geospatial_bounds': None,
@@ -562,10 +582,14 @@ class GliderDataModel(object):
         max_time = time_index.max()
         min_depth = np.nanmin(depths)
         max_depth = np.nanmax(depths)
-        min_lat = np.nanmin(self._ds.ilatitude)
-        max_lat = np.nanmax(self._ds.ilatitude)
-        min_lon = np.nanmin(self._ds.ilongitude)
-        max_lon = np.nanmax(self._ds.ilongitude)
+        # min_lat = np.nanmin(self._ds.ilatitude)
+        # max_lat = np.nanmax(self._ds.ilatitude)
+        # min_lon = np.nanmin(self._ds.ilongitude)
+        # max_lon = np.nanmax(self._ds.ilongitude)
+        min_lat = np.nanmin(self._ds.latitude)
+        max_lat = np.nanmax(self._ds.latitude)
+        min_lon = np.nanmin(self._ds.longitude)
+        max_lon = np.nanmax(self._ds.longitude)
 
         atts['geospatial_bounds'] = geospatial_bounds_wkt(min_lat, max_lat, min_lon, max_lon)
         atts['geospatial_lat_min'] = min_lat
@@ -584,13 +608,13 @@ class GliderDataModel(object):
         return atts
 
     def __repr__(self):
-        has_data = False
-        if not self._df.empty:
-            has_data = True
+        # has_data = False
+        # if not self._df.empty:
+        #     has_data = True
         is_configured = True
         for config_type, item_type in self._config_parameters.items():
             if not self._config_parameters[config_type]:
                 is_configured = False
                 break
-        return '<GliderNetCDF(cfg={:}, data={:}, profiles={:})>'.format(is_configured, has_data,
+        return '<GliderNetCDF(cfg={:}, data={:}, profiles={:})>'.format(is_configured, self._df.shape,
                                                                         self._profiles_meta.shape[0])
